@@ -4,10 +4,11 @@
 use serialize::{Decodable, Encodable};
 use serialize::json::{Decoder, DecoderError, decode, Encoder};
 use std::comm;
-use std::io::{IoError, IoErrorKind, IoResult, TcpStream};
+use std::io::{IoError, IoResult, TcpStream};
+use std::io::IoErrorKind::{EndOfFile, TimedOut};
 use std::io::net::ip::ToSocketAddr;
 use std::io::net::tcp::TcpAcceptor;
-use std::sync::{Arc, Future, Mutex};
+use std::sync::Future;
 use super::{SendRequest, ReceiverError};
 
 /// `TcpSender` is the sender half of a TCP connection.
@@ -23,15 +24,19 @@ impl<T> TcpSender<T> where T: Encodable<Encoder<'static>, IoError> + Send {
         spawn(proc() {
             for (t, fi) in rx.iter() {
                 let e = Encoder::buffer_encode(&t);
-                stream.write_le_uint(e.len());
-                stream.write(e.as_slice());
-                stream.flush();
-                // TODO: use the responses from the above calls to send an error if appropriate
-                fi.send(Ok(()));
+                let result = send(&mut stream, e);
+                fi.send_opt(result);
             }
         });
         Ok(TcpSender(tx))
     }
+}
+
+fn send(stream: &mut TcpStream, data: Vec<u8>) -> IoResult<()> {
+    try!(stream.write_le_uint(data.len()));
+    try!(stream.write(data.as_slice()));
+    try!(stream.flush());
+    Ok(())
 }
 
 impl<T> super::Sender<T> for TcpSender<T> where T: Encodable<Encoder<'static>, IoError> + Send {
@@ -45,9 +50,8 @@ impl<T> super::Sender<T> for TcpSender<T> where T: Encodable<Encoder<'static>, I
 
 /// TcpReceiver is the receiver half of a TCP connection.
 pub struct TcpReceiver<T> {
-    streams: Arc<Mutex<Vec<TcpStream>>>,
+    streams: Receiver<TcpStream>,
     acceptor: TcpAcceptor,
-    closed: bool,
 }
 
 impl<T> TcpReceiver<T> {
@@ -57,26 +61,34 @@ impl<T> TcpReceiver<T> {
         use std::io::{Acceptor, Listener};
         use std::io::net::tcp::TcpListener;
 
-        let streams = Arc::new(Mutex::new(Vec::new()));
+        let (tx, rx) = channel();
 
         let listener = try!(TcpListener::bind(addr));
         let acceptor = try!(listener.listen());
-        {
-            let streams = streams.clone();
-            let mut acceptor = acceptor.clone();
-            spawn(proc() {
-                for stream in acceptor.incoming() {
-                    let mut streams = streams.lock();
-                    match stream {
-                        Ok(stream) => streams.push(stream),
-                        Err(ref e) if e.kind == IoErrorKind::EndOfFile => return,
-                        Err(e) => panic!("{}", e),
-                    }
+        let mut acceptor2 = acceptor.clone();
+        spawn(proc() {
+            for stream in acceptor2.incoming() {
+                match stream {
+                    Ok(stream) => tx.send(stream),
+                    Err(IoError{kind: EndOfFile, ..}) => return,
+                    Err(e) => panic!("{}", e),
                 }
-            });
-        }
+            }
+        });
 
-        Ok(TcpReceiver{ streams: streams, acceptor: acceptor, closed: false })
+        Ok(TcpReceiver{ streams: rx, acceptor: acceptor, })
+    }
+
+}
+
+fn get_size(stream: &mut TcpStream) -> Result<uint, ReceiverError> {
+    loop {
+        stream.set_read_timeout(Some(10)); // TODO: set this value as a config?
+        match stream.read_le_uint() {
+            Ok(size) => return Ok(size),
+            Err(IoError{kind: TimedOut, ..}) => continue,
+            Err(e) => return Err(ReceiverError::IoError(e)),
+        }
     }
 }
 
@@ -84,43 +96,12 @@ impl<T> super::Receiver<T> for TcpReceiver<T> where T: Decodable<Decoder, Decode
     /// Attempt to receive a value on the channel. This method blocks until a value
     /// is available.
     fn try_recv(&mut self) -> Result<T, ReceiverError> {
-        use std::task;
-        let mut finished = Vec::new();
-        loop {
-            {
-                if self.closed {
-                    return Err(ReceiverError::EndOfFile);
-                }
-                let mut streams = self.streams.lock();
-                let mut found = None;
-                for (i, stream) in streams.iter_mut().enumerate() {
-                    stream.set_read_timeout(Some(10)); // TODO: set this value as a config?
-                    let size = match stream.read_le_uint() {
-                        Ok(size) => size,
-                        Err(ref e) if e.kind == IoErrorKind::TimedOut => continue,
-                        Err(ref e) if e.kind == IoErrorKind::EndOfFile => { finished.push(i); continue },
-                        Err(e) => return Err(ReceiverError::IoError(e)),
-                    };
-                    let data = try!(stream.read_exact(size));
-                    let string = try!(String::from_utf8(data));
-                    let decoded = try!(decode::<T>(string.as_slice()));
-                    found = Some(decoded);
-                    break;
-                }
-                if finished.len() > 0 {
-                    let mut offset = 0u;
-                    for i in finished.iter() {
-                        streams.remove(*i - offset);
-                        offset += 1;
-                    }
-                    finished.clear();
-                }
-                if let Some(decoded) = found {
-                    return Ok(decoded);
-                }
-            }
-            task::deschedule();
-        }
+        let mut stream = self.streams.recv();
+        let size = try!(get_size(&mut stream));
+        let data = try!(stream.read_exact(size));
+        let string = try!(String::from_utf8(data));
+        let decoded = try!(decode::<T>(string.as_slice()));
+        Ok(decoded)
     }
 }
 
@@ -129,7 +110,6 @@ impl<T> Drop for TcpReceiver<T> {
     #[allow(unused_must_use)]
     fn drop(&mut self) {
         self.acceptor.close_accept();
-        self.closed = true;
     }
 }
 
